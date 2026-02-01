@@ -127,15 +127,19 @@ We provide a unified, production-ready Docker image that contains the entire con
 The official unified image is available on [Docker Hub](https://hub.docker.com/r/inferiaai/inferiallm).
 
 ```bash
-# 1. Download the docker-compose and sample env
-curl -L https://raw.githubusercontent.com/InferiaAI/InferiaLLM/main/deploy/docker-compose.yml -o docker-compose.yml
-curl -L https://raw.githubusercontent.com/InferiaAI/InferiaLLM/main/.env.sample -o .env
+# 1. Pull the official image
+docker pull inferiaai/inferiallm:latest
 
-# 2. Configure your credentials in .env
+# 2. Download and configure environment
+curl -L https://raw.githubusercontent.com/InferiaAI/InferiaLLM/main/.env.sample -o .env
 nano .env
 
-# 3. Start the stack
-docker compose up -d
+# 3. Run the container
+docker run -d \
+  --name inferia-app \
+  --env-file .env \
+  -p 8000:8000 -p 8001:8001 -p 8080:8080 -p 3000:3000 -p 3001:3001 \
+  inferiaai/inferiallm:latest
 ```
 
 #### Option B: Build from Source
@@ -242,11 +246,13 @@ Initialize the control-plane databases, roles, and schemas.
 Start Inferia services. You can start all services at once or specific components.
 
 **Usage:**
+
 ```bash
 inferiallm start [service]
 ```
 
 **Arguments:**
+
 * `all`: Start all services (default)
 * `orchestration`: Start Orchestration Gateway stack
 * `inference`: Start Inference Gateway
