@@ -68,7 +68,7 @@ export default function NewPool() {
 
         switch (pid) {
             case "nosana":
-                return !!depin.nosana?.wallet_private_key;
+                return !!(depin.nosana?.wallet_private_key || depin.nosana?.api_key);
             case "akash":
                 return !!depin.akash?.mnemonic;
             case "aws":

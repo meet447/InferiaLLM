@@ -81,16 +81,20 @@ class Settings(BaseSettings):
     # Server Settings
     host: str = "0.0.0.0"
     port: int = 8000
-    reload: bool = True
+    reload: bool = Field(default=False, validation_alias="DEBUG_RELOAD")
 
     # Multi-tenancy / Organization Settings
     default_org_name: str = "Default Organization"
-    superadmin_email: str = "admin@example.com"
-    superadmin_password: str = Field(default="admin123", min_length=1)
+    superadmin_email: str = Field(
+        default="admin@example.com", validation_alias="SUPERADMIN_EMAIL"
+    )
+    superadmin_password: str = Field(
+        default="", min_length=5, validation_alias="SUPERADMIN_PASSWORD"
+    )
 
     # Internal API Key (for service-to-service auth)
     internal_api_key: str = Field(
-        default="dev-internal-key-change-in-prod", min_length=1
+        default="", min_length=32, validation_alias="INTERNAL_API_KEY"
     )
     allowed_origins: str = (
         "http://localhost:8001,http://localhost:5173"  # Comma-separated list
@@ -98,7 +102,7 @@ class Settings(BaseSettings):
 
     # RBAC Settings
     jwt_secret_key: str = Field(
-        default="dev-secret-key-change-in-production", min_length=1
+        default="", min_length=32, validation_alias="JWT_SECRET_KEY"
     )
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 30

@@ -4,6 +4,9 @@ from sqlalchemy.future import select
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
 import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def utcnow_naive():
@@ -136,11 +139,11 @@ async def update_provider_config(
         if "guardrails" in new_data:
             groq_new = new_data["guardrails"].get("groq", {}).get("api_key")
             if groq_new:
-                print(
-                    f"[DEBUG] Config Update: New Groq API Key received: {groq_new[:6]}..."
+                logger.info(
+                    "Config Update: New Groq API Key received: %s...", groq_new[:6]
                 )
     except Exception as e:
-        print(f"[DEBUG] Failed to write config: {e}")
+        logger.error("Failed to write config: %s", e)
         raise HTTPException(status_code=500, detail=f"Failed to save config: {e}")
 
     # Refresh data engine client if vectordb config was updated
@@ -158,12 +161,12 @@ async def update_provider_config(
                 try:
                     await asyncio.to_thread(data_engine.initialize_client)
                 except Exception as e:
-                    print(f"[DEBUG] Background Chroma refresh failed: {e}")
+                    logger.error("Background Chroma refresh failed: %s", e)
 
             asyncio.create_task(refresh_chroma())
 
         except Exception as e:
-            print(f"[DEBUG] Failed to trigger data engine refresh: {e}")
+            logger.error("Failed to trigger data engine refresh: %s", e)
 
     if wrapper.providers.guardrails:
         try:
@@ -176,11 +179,11 @@ async def update_provider_config(
                         guardrail_settings.refresh_from_main_settings
                     )
                 except Exception as e:
-                    print(f"[DEBUG] Background Guardrail refresh failed: {e}")
+                    logger.error("Background Guardrail refresh failed: %s", e)
 
             asyncio.create_task(refresh_guardrails())
         except Exception as e:
-            print(f"[DEBUG] Failed to trigger guardrail refresh: {e}")
+            logger.error("Failed to trigger guardrail refresh: %s", e)
 
     return {"status": "ok", "message": "Configuration saved to database"}
 
