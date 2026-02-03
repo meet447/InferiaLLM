@@ -10,6 +10,10 @@ const EXTEND_THRESHOLD_MS = 5 * 60 * 1000;
 const EXTEND_DURATION_SECS = 1800;
 const MIN_RUNTIME_FOR_REDEPLOY_MS = 20 * 60 * 1000;
 
+// Nosana Dashboard API constants
+const NOSANA_API_BASE_URL = process.env.NOSANA_API_URL || 'https://dashboard.k8s.prd.nos.ci/api';
+const SIGN_MESSAGE = 'Hello Nosana Node!';
+
 interface WatchedJobInfo {
     jobAddress: string;
     deploymentUuid?: string;         // Required for API-mode auth
@@ -49,6 +53,9 @@ export class NosanaService {
     private authMode: 'wallet' | 'api' = 'wallet';
     private watchedJobs = new Map<string, WatchedJobInfo>();
     private summaryInterval: number = 60000;
+    // Cache for API-signed auth headers
+    private cachedApiAuth: { signature: string; message: string; userAddress: string; timestamp: number } | null = null;
+    private readonly API_AUTH_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
     constructor(options: { privateKey?: string, apiKey?: string, rpcUrl?: string }) {
         this.privateKey = options.privateKey;
@@ -72,6 +79,146 @@ export class NosanaService {
         }
 
         this.startWatchdogSummary();
+    }
+
+    /**
+     * Get the authorization header for API mode
+     */
+    private getApiAuthHeader(): string {
+        if (!this.apiKey) throw new Error('API key not configured');
+        return `Bearer ${this.apiKey}`;
+    }
+
+    /**
+     * Make an authenticated API request to Nosana Dashboard API
+     */
+    private async apiRequest<T>(path: string, options: {
+        method?: string;
+        body?: any;
+        headers?: Record<string, string>;
+    } = {}): Promise<T> {
+        const { method = 'GET', body, headers = {} } = options;
+
+        const url = `${NOSANA_API_BASE_URL}${path}`;
+        const fetchOptions: RequestInit = {
+            method,
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': this.getApiAuthHeader(),
+                ...headers
+            }
+        };
+
+        if (body && method !== 'GET') {
+            fetchOptions.body = JSON.stringify(body);
+        }
+
+        const response = await fetch(url, fetchOptions);
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Nosana API Error (${response.status}): ${errorText}`);
+        }
+
+        return response.json() as Promise<T>;
+    }
+
+    /**
+     * Sign a message using the Nosana API external signing endpoint
+     * This is used for API mode to get signatures for node authentication
+     * POST /api/auth/sign-message/external
+     */
+    async signMessageExternal(message: string): Promise<{ signature: string; message: string; userAddress: string }> {
+        if (this.authMode !== 'api') {
+            throw new Error('signMessageExternal is only available in API mode');
+        }
+
+        // Check cache
+        const now = Date.now();
+        if (
+            this.cachedApiAuth &&
+            this.cachedApiAuth.message === message &&
+            (now - this.cachedApiAuth.timestamp) < this.API_AUTH_CACHE_TTL_MS
+        ) {
+            console.log('[API Auth] Using cached signature');
+            return {
+                signature: this.cachedApiAuth.signature,
+                message: this.cachedApiAuth.message,
+                userAddress: this.cachedApiAuth.userAddress
+            };
+        }
+
+        console.log(`[API Auth] Requesting signed message from Nosana API...`);
+        const result = await this.apiRequest<{ signature: string; message: string; userAddress: string }>(
+            '/auth/sign-message/external',
+            {
+                method: 'POST',
+                body: { message }
+            }
+        );
+
+        // Cache the result
+        this.cachedApiAuth = {
+            ...result,
+            timestamp: now
+        };
+
+        console.log(`[API Auth] Received signature for user: ${result.userAddress}`);
+        return result;
+    }
+
+    /**
+     * Generate authentication header for node communication in API mode
+     * Format: MESSAGE:SIGNATURE (same as wallet mode)
+     */
+    async generateApiNodeAuthHeader(): Promise<{ header: string; userAddress: string }> {
+        const auth = await this.signMessageExternal(SIGN_MESSAGE);
+        return {
+            header: `${auth.message}:${auth.signature}`,
+            userAddress: auth.userAddress
+        };
+    }
+
+    /**
+     * Get job details from the Nosana Dashboard API
+     * GET /api/jobs/{address}
+     * This provides additional metadata about jobs that is not available from on-chain data.
+     */
+    async getJobFromApi(jobAddress: string): Promise<{
+        owner: string;
+        market: string;
+        node: string;
+        ipfsJob: string;
+        ipfsResult: string | null;
+        timeStart: number;
+        timeEnd: number | null;
+        status: number;
+        state: string;
+        marketName: string | null;
+    } | null> {
+        if (this.authMode !== 'api') {
+            return null;
+        }
+
+        try {
+            const jobDetails = await this.apiRequest<{
+                owner: string;
+                market: string;
+                node: string;
+                ipfsJob: string;
+                ipfsResult: string | null;
+                timeStart: number;
+                timeEnd: number | null;
+                status: number;
+                state: string;
+                marketName: string | null;
+            }>(`/jobs/${jobAddress}`);
+
+            return jobDetails;
+        } catch (error: any) {
+            console.warn(`[API] Failed to get job details for ${jobAddress}:`, error.message);
+            return null;
+        }
     }
 
     markJobAsStopping(jobAddress: string): void {
@@ -136,36 +283,66 @@ export class NosanaService {
             let ipfsHash = "pending";
 
             if (this.authMode === 'api') {
-                console.log(`[Launch] Creating deployment via API in market: ${marketAddress}`);
-                const deployment = await this.client.api.deployments.create({
-                    name: `inferia-${Date.now()}`,
-                    market: marketAddress,
-                    job_definition: definitionToPin,
-                    replicas: 1,
-                    timeout: 3600,
-                    strategy: 1, // Fix/Deterministic strategy
-                } as any);
+                console.log(`[Launch] Posting job via API in market: ${marketAddress}`);
 
-                deploymentUuid = (deployment as any).uuid || (deployment as any).id;
-                console.log(`[Launch] Deployment created: ${deploymentUuid}. Waiting for Job Address...`);
+                // Step 1: Pin the job definition to IPFS first
+                // The API requires an ipfsHash, not a raw job_definition
+                console.log(`[Launch] Pinning job definition to IPFS...`);
+                ipfsHash = await this.client.ipfs.pin(definitionToPin);
+                console.log(`[Launch] IPFS Hash: ${ipfsHash}`);
 
-                // Bridge: Poll for Job Address
-                let attempts = 0;
-                while (attempts < 30) {
-                    const status = await this.client.api.deployments.get(deploymentUuid!);
-                    const jobs = (status as any).jobs || [];
-                    if (jobs.length > 0) {
-                        jobAddress = jobs[0].address || jobs[0].job;
-                        ipfsHash = jobs[0].ipfs_job;
-                        console.log(`[Launch] Resolved Job Address from API: ${jobAddress}`);
-                        break;
+                // Step 2: Use the direct HTTP API: POST /api/jobs/list
+                // This endpoint expects: { ipfsHash: string, market: string }
+                try {
+                    console.log(`[Launch] Using direct HTTP API POST /api/jobs/list...`);
+                    const jobListResult = await this.apiRequest<{
+                        tx: string;
+                        job: string;
+                        credits: { costUSD: number; creditsUsed: number; reservationId: string };
+                    }>('/jobs/list', {
+                        method: 'POST',
+                        body: {
+                            ipfsHash: ipfsHash,
+                            market: marketAddress
+                        }
+                    });
+
+                    jobAddress = jobListResult.job;
+                    console.log(`[Launch] Job posted via direct API. Address: ${jobAddress}, TX: ${jobListResult.tx}, Credits Used: ${jobListResult.credits.creditsUsed}`);
+                } catch (apiError: any) {
+                    // Fallback: Try SDK deployment API if direct API fails
+                    console.warn(`[Launch] Direct API failed: ${apiError.message}. Falling back to SDK deployments API...`);
+
+                    const deployment = await this.client.api.deployments.create({
+                        name: `inferia-${Date.now()}`,
+                        market: marketAddress,
+                        job_definition: definitionToPin,
+                        replicas: 1,
+                        timeout: 3600,
+                        strategy: 1, // Fix/Deterministic strategy
+                    } as any);
+
+                    deploymentUuid = (deployment as any).uuid || (deployment as any).id;
+                    console.log(`[Launch] Deployment created: ${deploymentUuid}. Waiting for Job Address...`);
+
+                    // Bridge: Poll for Job Address
+                    let attempts = 0;
+                    while (attempts < 30) {
+                        const status = await this.client.api.deployments.get(deploymentUuid!);
+                        const jobs = (status as any).jobs || [];
+                        if (jobs.length > 0) {
+                            jobAddress = jobs[0].address || jobs[0].job;
+                            ipfsHash = jobs[0].ipfs_job || ipfsHash;
+                            console.log(`[Launch] Resolved Job Address from SDK: ${jobAddress}`);
+                            break;
+                        }
+                        await new Promise(r => setTimeout(r, 2000));
+                        attempts++;
                     }
-                    await new Promise(r => setTimeout(r, 2000));
-                    attempts++;
-                }
 
-                if (jobAddress === "unknown") {
-                    throw new Error("Timeout waiting for Job Address from Nosana API");
+                    if (jobAddress === "unknown") {
+                        throw new Error("Timeout waiting for Job Address from Nosana API");
+                    }
                 }
 
             } else {
@@ -224,14 +401,14 @@ export class NosanaService {
             try {
                 // Use retry wrapper to handle 429s gracefully during polling
                 job = await retry(() => this.client.jobs.get(addr), 3, 2000);
-                
+
                 if (job.state === JobState.RUNNING || (job.state as any) === 1) {
                     console.log(`[Confidential] Job ${jobAddress} is RUNNING on node ${job.node}. Sending definition...`);
                     break;
                 }
                 if (job.state === JobState.COMPLETED || job.state === JobState.STOPPED) {
-                     console.warn(`[Confidential] Job ${jobAddress} ended before we could send definition.`);
-                     return;
+                    console.warn(`[Confidential] Job ${jobAddress} ended before we could send definition.`);
+                    return;
                 }
             } catch (e) { }
             // Increase polling interval to 3s to reduce load
@@ -239,18 +416,21 @@ export class NosanaService {
         }
 
         if (!job || (job.state !== JobState.RUNNING && (job.state as any) !== 1)) {
-             console.error(`[Confidential] Timeout waiting for job ${jobAddress} to run.`);
-             return;
+            console.error(`[Confidential] Timeout waiting for job ${jobAddress} to run.`);
+            return;
         }
 
         try {
             let fetchHeaders: any = { 'Content-Type': 'application/json' };
+            let walletAddress: string | undefined;
 
-            if (this.authMode === 'api' && deploymentUuid) {
-                console.log(`[Confidential] Requesting Auth Header from API for deployment ${deploymentUuid}...`);
-                const deployment = await this.client.api.deployments.get(deploymentUuid);
-                const authHeader = await (deployment as any).generateAuthHeader();
-                fetchHeaders['Authorization'] = authHeader;
+            if (this.authMode === 'api') {
+                // Use the external signing API to get a signed message for node authentication
+                console.log(`[Confidential] Requesting Auth Header from API for job ${jobAddress}...`);
+                const apiAuth = await this.generateApiNodeAuthHeader();
+                fetchHeaders['Authorization'] = apiAuth.header;
+                walletAddress = apiAuth.userAddress;
+                console.log(`[Confidential] Got API auth header for wallet: ${walletAddress}`);
             } else {
                 const headers = await this.client.authorization.generateHeaders(dummyIpfsHash, { includeTime: true } as any);
                 headers.forEach((value, key) => { fetchHeaders[key] = value; });
@@ -259,7 +439,7 @@ export class NosanaService {
             const domain = process.env.NOSANA_INGRESS_DOMAIN || "node.k8s.prd.nos.ci";
             const canonicalJobAddress = job.address.toString();
             const nodeUrl = `https://${job.node}.${domain}/job/${canonicalJobAddress}/job-definition`;
-            
+
             console.log(`[Confidential] Posting definition to ${nodeUrl}...`);
 
             const sendDef = async (headers: any) => {
@@ -279,19 +459,20 @@ export class NosanaService {
                 await sendDef(fetchHeaders);
             } catch (e: any) {
                 if (e.status >= 400 && e.status < 500) {
-                     console.warn(`[Confidential] Node rejected definition (${e.status} - ${e.message}), retrying in 5s...`);
-                     await new Promise(r => setTimeout(r, 5000));
-                     
-                     // Regenerate headers
-                     if (this.authMode === 'api' && deploymentUuid) {
-                         const deployment = await this.client.api.deployments.get(deploymentUuid);
-                         fetchHeaders['Authorization'] = await (deployment as any).generateAuthHeader();
-                     } else {
-                         const newHeaders = await this.client.authorization.generateHeaders(dummyIpfsHash, { includeTime: true } as any);
-                         newHeaders.forEach((value, key) => { fetchHeaders[key] = value; });
-                     }
+                    console.warn(`[Confidential] Node rejected definition (${e.status} - ${e.message}), retrying in 5s...`);
+                    await new Promise(r => setTimeout(r, 5000));
 
-                     await sendDef(fetchHeaders);
+                    // Regenerate headers - clear cache to force fresh signature
+                    if (this.authMode === 'api') {
+                        this.cachedApiAuth = null; // Clear cache to get fresh signature
+                        const apiAuth = await this.generateApiNodeAuthHeader();
+                        fetchHeaders['Authorization'] = apiAuth.header;
+                    } else {
+                        const newHeaders = await this.client.authorization.generateHeaders(dummyIpfsHash, { includeTime: true } as any);
+                        newHeaders.forEach((value, key) => { fetchHeaders[key] = value; });
+                    }
+
+                    await sendDef(fetchHeaders);
                 } else {
                     throw e;
                 }
@@ -305,7 +486,7 @@ export class NosanaService {
                     const domain = process.env.NOSANA_INGRESS_DOMAIN || "node.k8s.prd.nos.ci";
                     const serviceUrl = `https://${services[0].hash}.${domain}`;
                     console.log(`[Confidential] Resolved Service URL from secret definition: ${serviceUrl}`);
-                    
+
                     const jobInfo = this.watchedJobs.get(jobAddress);
                     if (jobInfo) {
                         jobInfo.serviceUrl = serviceUrl;
@@ -352,11 +533,23 @@ export class NosanaService {
     async stopJob(jobAddress: string) {
         try {
             console.log(`Attempting to stop job: ${jobAddress} (Mode: ${this.authMode})`);
-            
+
             if (this.authMode === 'api') {
-                await this.client.api.jobs.stop(jobAddress);
-                console.log(`Job ${jobAddress} stopped via API`);
-                return { status: "stopped" };
+                // Use direct HTTP API: POST /api/jobs/{address}/stop
+                console.log(`[API] Stopping job via HTTP API...`);
+                const result = await this.apiRequest<{ tx: string; job: string; delisted: boolean }>(
+                    `/jobs/${jobAddress}/stop`,
+                    { method: 'POST' }
+                );
+                console.log(`Job ${jobAddress} stopped via API. TX: ${result.tx}, Delisted: ${result.delisted}`);
+
+                this.sendAuditLog({
+                    action: "JOB_STOPPED",
+                    jobAddress,
+                    details: { tx: result.tx, delisted: result.delisted, manual_stop: true, via: 'api' }
+                });
+
+                return { status: "stopped", txSignature: result.tx, delisted: result.delisted };
             } else {
                 const addr = address(jobAddress);
                 const job = await retry(() => this.client.jobs.get(addr));
@@ -395,10 +588,27 @@ export class NosanaService {
         try {
             console.log(`Extending job ${jobAddress} by ${duration} seconds...`);
             const addr = address(jobAddress);
-            
+
             if (this.authMode === 'api') {
-                await this.client.api.jobs.extend({ address: jobAddress, seconds: duration } as any);
-                return { status: "success", jobAddress };
+                // Use direct HTTP API: POST /api/jobs/{address}/extend
+                // Note: API expects "seconds" field in request body
+                console.log(`[API] Extending job via HTTP API by ${duration} seconds...`);
+                const result = await this.apiRequest<{ tx: string; job: string; credits: { costUSD: number; creditsUsed: number; reservationId: string } }>(
+                    `/jobs/${jobAddress}/extend`,
+                    {
+                        method: 'POST',
+                        body: { seconds: duration }
+                    }
+                );
+                console.log(`Job ${jobAddress} extended via API. TX: ${result.tx}, Credits Used: ${result.credits.creditsUsed}`);
+
+                this.sendAuditLog({
+                    action: "JOB_EXTENDED",
+                    jobAddress,
+                    details: { duration, tx: result.tx, creditsUsed: result.credits.creditsUsed, via: 'api' }
+                });
+
+                return { status: "success", jobAddress, txSignature: result.tx, creditsUsed: result.credits.creditsUsed };
             } else {
                 const instruction = await this.client.jobs.extend({
                     job: addr,
@@ -427,8 +637,13 @@ export class NosanaService {
     }
 
     async getLogStreamer() {
-        if (!this.client.wallet && this.authMode === 'wallet') throw new Error("Wallet not initialized");
-        return new LogStreamer(this.client.wallet as any);
+        if (this.authMode === 'api') {
+            // For API mode, pass an auth provider function that uses the external signing API
+            return new LogStreamer(null, () => this.generateApiNodeAuthHeader());
+        } else {
+            if (!this.client.wallet) throw new Error("Wallet not initialized");
+            return new LogStreamer(this.client.wallet as any);
+        }
     }
 
     async getJob(jobAddress: string) {
@@ -490,10 +705,10 @@ export class NosanaService {
             const result = await retry(() => this.client.ipfs.retrieve(job.ipfsResult!));
             return { status: "completed", ipfsHash: job.ipfsResult, result: result };
         } catch (error: any) {
-             if (error.message && error.message.includes("IPFS")) {
-                 console.log(`[Confidential] IPFS fetch failed. Attempting direct node retrieval for ${jobAddress}...`);
-                 return this.retrieveConfidentialResults(jobAddress);
-             }
+            if (error.message && error.message.includes("IPFS")) {
+                console.log(`[Confidential] IPFS fetch failed. Attempting direct node retrieval for ${jobAddress}...`);
+                return this.retrieveConfidentialResults(jobAddress);
+            }
             console.error("Get Logs Error:", error);
             throw new Error(`Get Logs Error: ${error.message}`);
         }
@@ -503,16 +718,17 @@ export class NosanaService {
         try {
             const addr = address(jobAddress);
             const job = await this.client.jobs.get(addr);
-            
+
             if (!job.ipfsJob) return { status: "pending", logs: ["Job has no IPFS hash."] };
 
             const dummyHash = job.ipfsJob;
             let fetchHeaders: any = {};
-            
-            const cachedJob = this.watchedJobs.get(jobAddress);
-            if (this.authMode === 'api' && cachedJob?.deploymentUuid) {
-                const deployment = await this.client.api.deployments.get(cachedJob.deploymentUuid);
-                fetchHeaders['Authorization'] = await (deployment as any).generateAuthHeader();
+
+            if (this.authMode === 'api') {
+                // Use the external signing API to get a signed message for node authentication
+                console.log(`[Confidential] Requesting Auth Header from API for results retrieval...`);
+                const apiAuth = await this.generateApiNodeAuthHeader();
+                fetchHeaders['Authorization'] = apiAuth.header;
             } else {
                 const headers = await this.client.authorization.generateHeaders(dummyHash, { includeTime: true } as any);
                 headers.forEach((value, key) => { fetchHeaders[key] = value; });
@@ -520,7 +736,7 @@ export class NosanaService {
 
             const domain = process.env.NOSANA_INGRESS_DOMAIN || "node.k8s.prd.nos.ci";
             const nodeUrl = `https://${job.node}.${domain}/job/${jobAddress}/results`;
-            
+
             console.log(`[Confidential] Fetching results from ${nodeUrl}...`);
             const response = await fetch(nodeUrl, {
                 method: "GET",
@@ -541,12 +757,40 @@ export class NosanaService {
 
     async getBalance() {
         if (this.authMode === 'api') {
-            const balance = await this.client.api.credits.balance();
-            return {
-                sol: 0,
-                nos: (balance as any).amount || "0",
-                address: "API_ACCOUNT"
-            };
+            try {
+                // Use direct API call for credits balance
+                // GET /api/credits/balance returns: { assignedCredits, reservedCredits, settledCredits }
+                const balance = await this.apiRequest<{
+                    assignedCredits: number;
+                    reservedCredits: number;
+                    settledCredits: number;
+                }>('/credits/balance');
+
+                // Calculate available credits: assigned - reserved - settled
+                const availableCredits = balance.assignedCredits - balance.reservedCredits - balance.settledCredits;
+
+                return {
+                    sol: 0,
+                    nos: availableCredits.toFixed(2),
+                    assignedCredits: balance.assignedCredits,
+                    reservedCredits: balance.reservedCredits,
+                    settledCredits: balance.settledCredits,
+                    address: "API_ACCOUNT"
+                };
+            } catch (error: any) {
+                console.error('[API] Failed to get balance:', error.message);
+                // Fallback to SDK if direct API fails
+                try {
+                    const balance = await this.client.api.credits.balance();
+                    return {
+                        sol: 0,
+                        nos: (balance as any).amount || "0",
+                        address: "API_ACCOUNT"
+                    };
+                } catch (e) {
+                    throw error; // Re-throw original error
+                }
+            }
         }
         const sol = await this.client.solana.getBalance();
         const nos = await this.client.nos.getBalance();
@@ -559,7 +803,33 @@ export class NosanaService {
 
     async recoverJobs() {
         if (this.authMode === 'api') {
-            console.log("Job recovery for API mode is handled by Deployment listing (not implemented yet)");
+            console.log("[Job Recovery] Attempting to recover jobs for API mode...");
+            try {
+                // API mode recovery is limited because the API doesn't expose a "list my jobs/deployments" endpoint
+                // For now, we can only recover jobs that are still in the watchedJobs cache
+                // Full recovery would require persisting job addresses externally (e.g., in a database)
+
+                // Check any known watched jobs that might have crashed
+                for (const [jobAddress, jobInfo] of this.watchedJobs.entries()) {
+                    try {
+                        const jobStatus = await this.getJob(jobAddress);
+                        if ((jobStatus.jobState === JobState.RUNNING || (jobStatus.jobState as any) === 1)) {
+                            console.log(`[Recovery] Job ${jobAddress} is still running - watchdog should be active`);
+                        } else {
+                            console.log(`[Recovery] Job ${jobAddress} is no longer running (state: ${jobStatus.jobState})`);
+                            // Remove from watched jobs if it's terminated
+                            this.watchedJobs.delete(jobAddress);
+                        }
+                    } catch (e) {
+                        console.warn(`[Recovery] Could not check job ${jobAddress}:`, e);
+                    }
+                }
+
+                console.log("[Job Recovery] API mode recovery complete (limited to cached jobs)");
+                console.log("[Job Recovery] Note: For full recovery, persist job addresses externally");
+            } catch (e: any) {
+                console.error("[Job Recovery] Failed to recover jobs in API mode:", e);
+            }
             return;
         }
         if (!this.client.wallet) return;
@@ -573,7 +843,7 @@ export class NosanaService {
                 const state = job.state;
                 if (((state as any) === JobState.RUNNING || (state as any) === 1) && !this.watchedJobs.has(jobAddress)) {
                     console.log(`Recovering watchdog for running job: ${jobAddress}`);
-                        this.watchJob(jobAddress, process.env.ORCHESTRATOR_URL || "http://localhost:8080", {
+                    this.watchJob(jobAddress, process.env.ORCHESTRATOR_URL || "http://localhost:8080", {
                         isConfidential: true,
                         resources_allocated: { gpu_allocated: 1, vcpu_allocated: 8, ram_gb_allocated: 32 }
                     });

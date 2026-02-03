@@ -5,21 +5,48 @@ import { EventEmitter } from 'events';
 const FRP_SERVER_ADDR = 'node.k8s.prd.nos.ci';
 const SIGN_MESSAGE = 'Hello Nosana Node!';
 
+// Type for API auth provider function
+export type ApiAuthProvider = () => Promise<{ header: string; userAddress: string }>;
+
 export class LogStreamer extends EventEmitter {
     private ws: WebSocket | null = null;
     private shouldReconnect: boolean = true;
     private retryCount: number = 0;
     private maxRetries: number = 10;
     private retryDelay: number = 3000;
+    private authMode: 'wallet' | 'api';
+    private walletSigner: any;
+    private apiAuthProvider: ApiAuthProvider | null;
 
-    constructor(private walletSigner: any) {
+    /**
+     * Create a new LogStreamer
+     * @param walletSignerOrApiAuth - Either a wallet signer (for wallet mode) or null (for API mode)
+     * @param apiAuthProvider - Function that returns API auth header (for API mode only)
+     */
+    constructor(walletSignerOrApiAuth: any, apiAuthProvider?: ApiAuthProvider) {
         super();
+
+        if (apiAuthProvider) {
+            // API mode
+            this.authMode = 'api';
+            this.walletSigner = null;
+            this.apiAuthProvider = apiAuthProvider;
+        } else {
+            // Wallet mode
+            this.authMode = 'wallet';
+            this.walletSigner = walletSignerOrApiAuth;
+            this.apiAuthProvider = null;
+        }
     }
 
     /**
-     * Generate authorization header with signed message
+     * Generate authorization header with signed message (wallet mode)
      */
-    async generateAuth() {
+    private async generateWalletAuth(): Promise<{ auth: string; walletAddress: string }> {
+        if (!this.walletSigner) {
+            throw new Error('Wallet signer not available');
+        }
+
         const message = SIGN_MESSAGE;
 
         // Get the keypair from the signer
@@ -34,7 +61,36 @@ export class LogStreamer extends EventEmitter {
         const signature = bs58.encode(signatureResult);
 
         // Format: MESSAGE:SIGNATURE
-        return `${message}:${signature}`;
+        return {
+            auth: `${message}:${signature}`,
+            walletAddress: publicKey
+        };
+    }
+
+    /**
+     * Generate authorization header using API (API mode)
+     */
+    private async generateApiAuth(): Promise<{ auth: string; walletAddress: string }> {
+        if (!this.apiAuthProvider) {
+            throw new Error('API auth provider not available');
+        }
+
+        const result = await this.apiAuthProvider();
+        return {
+            auth: result.header,
+            walletAddress: result.userAddress
+        };
+    }
+
+    /**
+     * Generate authorization header (auto-detects mode)
+     */
+    async generateAuth(): Promise<{ auth: string; walletAddress: string }> {
+        if (this.authMode === 'api') {
+            return this.generateApiAuth();
+        } else {
+            return this.generateWalletAuth();
+        }
     }
 
     /**
@@ -44,7 +100,7 @@ export class LogStreamer extends EventEmitter {
      */
     async connect(nodeAddress: string, jobAddress: string): Promise<void> {
         const url = `wss://${nodeAddress}.${FRP_SERVER_ADDR}`;
-        console.log(`[LogStreamer] Connecting to ${url}`);
+        console.log(`[LogStreamer] Connecting to ${url} (mode: ${this.authMode})`);
 
         return new Promise((resolve, reject) => {
             this.ws = new WebSocket(url);
@@ -54,8 +110,7 @@ export class LogStreamer extends EventEmitter {
                 this.retryCount = 0;
 
                 try {
-                    const auth = await this.generateAuth();
-                    const walletAddress = this.walletSigner.address.toString();
+                    const { auth, walletAddress } = await this.generateAuth();
 
                     const subscribeMessage = {
                         path: '/log',
@@ -66,7 +121,7 @@ export class LogStreamer extends EventEmitter {
                         header: auth
                     };
 
-                    console.log(`[LogStreamer] Subscribing to logs for job ${jobAddress}`);
+                    console.log(`[LogStreamer] Subscribing to logs for job ${jobAddress} (wallet: ${walletAddress})`);
                     this.ws?.send(JSON.stringify(subscribeMessage));
                     resolve();
                 } catch (err) {
